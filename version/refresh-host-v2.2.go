@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"os/user"
 	"path/filepath"
@@ -113,9 +114,12 @@ func main() {
 					
 					fmt.Printf("[*] 检测到变化! 事件类型: %v, 文件: %s\n", event.Op, event.Name)
 					
-					// 记录修改事件
-					eventDesc := fmt.Sprintf("Hosts 文件被修改 - 事件类型: %v, 用户: %s, 权限: %s", 
-						event.Op, getCurrentUser(), getAdminStatus())
+					// 获取进程信息
+					processInfo := getOpenFileProcess()
+					
+					// 记录修改事件（包含进程信息）
+					eventDesc := fmt.Sprintf("Hosts 文件被修改 - 事件类型: %v, 用户: %s, 权限: %s, 进程: %s", 
+						event.Op, getCurrentUser(), getAdminStatus(), processInfo)
 					logEvent("Hosts 文件修改", eventDesc)
 					
 					// 简单的防抖处理，防止编辑器保存时触发多次
@@ -273,4 +277,80 @@ func logEvent(eventType string, description string) {
 	
 	// 同时输出到控制台
 	fmt.Print(logMessage)
+}
+
+// getModifyingProcesses 获取修改hosts文件的进程信息
+func getModifyingProcesses() string {
+	// 使用 Get-Process 和 wmi 查询打开 hosts 文件的进程
+	// 使用 lsof 或类似工具在 Windows 上需要额外权限
+	
+	// 尝试从 lsof (如果可用) 获取打开文件的进程
+	processInfo := getOpenFileProcess()
+	if processInfo != "" {
+		return processInfo
+	}
+	
+	return "进程信息:未知"
+}
+
+// getOpenFileProcess 通过系统接口获取打开hosts文件的进程
+func getOpenFileProcess() string {
+	// 尝试使用 PowerShell 的 Get-Process 和 wmi 查询
+	cmd := exec.Command("powershell", "-Command", 
+		`Get-Process | Where-Object { $_.Name -match 'notepad|vim|code|editor' } | Select-Object Name,Id | ForEach-Object { "$($_.Name) (PID:$($_.Id))" }`)
+	
+	output, err := cmd.Output()
+	if err != nil {
+		// 降级方案：尝试获取最后修改hosts的用户进程
+		return getLastModifyingProcess()
+	}
+	
+	result := strings.TrimSpace(string(output))
+	if result != "" {
+		return result
+	}
+	；
+	return getLastModifyingProcess()
+}
+
+// getLastModifyingProcess 获取最后修改文件的进程（通过文件属性）
+func getLastModifyingProcess() string {
+	// 由于直接获取打开文件的进程在Go中需要系统级API调用
+	// 这里使用一个近似方案：记录尝试访问的主要应用类型
+	
+	// 检查当前系统中常见的编辑工具
+	commonEditors := []string{
+		"notepad.exe",
+		"notepad++.exe", 
+		"vim.exe",
+		"code.exe",
+		"VSCode.exe",
+		"sublime.exe",
+		"Typora.exe",
+	}
+	
+	for _, editor := range commonEditors {
+		cmd := exec.Command("tasklist", "/FI", fmt.Sprintf(`IMAGENAME eq %s`, editor))
+		output, err := cmd.Output()
+		if err == nil && strings.Contains(string(output), editor) {
+			// 获取进程 ID
+			pidCmd := exec.Command("powershell", "-Command", 
+				fmt.Sprintf(`Get-Process -Name "%s" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Id`, strings.TrimSuffix(editor, ".exe")))
+			pidOutput, _ := pidCmd.Output()
+			pid := strings.TrimSpace(string(pidOutput))
+			if pid != "" {
+				return fmt.Sprintf("%s (PID:%s)", editor, pid)
+			}
+			return editor
+		}
+	}
+	
+	return "进程:未检测到编辑器进程"
+}
+
+// logEventWithProcess 记录包含进程信息的事件
+func logEventWithProcess(eventType string, description string) {
+	processInfo := getOpenFileProcess()
+	fullDesc := fmt.Sprintf("%s | %s", description, processInfo)
+	logEvent(eventType, fullDesc)
 }

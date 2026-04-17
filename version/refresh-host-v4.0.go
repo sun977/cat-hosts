@@ -1,20 +1,27 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/getlantern/systray"
 )
+
+// 嵌入图标文件到程序中
+//go:embed app.ico
+var embeddedIcon []byte
 
 // 配置常量
 const (
@@ -28,6 +35,7 @@ const (
 
 // 全局变量：日志文件路径（在启动时初始化）
 var LogPath string
+var shouldExit bool = false
 
 func main() {
 	// 1. 初始化日志文件路径（当前程序所在目录）
@@ -38,49 +46,58 @@ func main() {
 	exeDir := filepath.Dir(exePath)
 	LogPath = filepath.Join(exeDir, "hosts-monitor.log")
 
-	// 2. 检查权限 (Windows检查管理员权限)
+	// 2. 立即隐藏程序窗口（Windows 专用）- 在权限检查之前隐藏！
+	hideConsoleWindow()
+
+	// 3. 检查权限 (Windows检查管理员权限)
 	if !isAdmin() {
-		fmt.Println("警告:当前不是管理员权限,程序可能无法读取或写入 hosts 文件")
-		fmt.Println("请以管理员权限运行此程序")
+		// 权限检查失败：显示错误提示给用户
+		showErrorMessageBox("错误", "本程序需要管理员权限才能运行！\n\n请以管理员身份运行本程序。")
+		logEvent("启动失败", "程序没有管理员权限，已退出")
+		os.Exit(1)
 	}
 
-	// 3. 初始化：确保备份文件存在
+	// 4. 初始化：确保备份文件存在
 	if err := initBackup(); err != nil {
-		log.Fatalf("初始化备份失败: %v", err)
+		logEvent("错误", fmt.Sprintf("初始化备份失败: %v", err))
+		return
 	}
 
-	// 4. 记录程序启动
+	// 5. 记录程序启动
 	logEvent("程序启动", fmt.Sprintf("Hosts 监控程序启动, 用户: %s, 权限: %s", getCurrentUser(), getAdminStatus()))
 
-	fmt.Printf("开始监控文件: %s\n", HostsPath)
-	fmt.Printf("备份文件位置: %s\n", BackupPath)
-	fmt.Printf("日志文件位置: %s\n", LogPath)
-	fmt.Println("按 Ctrl+C 退出程序...")
+	// 6. 启动系统托盘
+	systray.Run(onReady, onExit)
+}
 
-	// 3. 创建监听器
+// onReady 系统托盘初始化
+func onReady() {
+	// 加载托盘图标
+	loadTrayIcon()
+
+	// 创建托盘菜单
+	mShowLog := systray.AddMenuItem("查看日志", "查看监控日志")
+	systray.AddSeparator()
+	mExit := systray.AddMenuItem("退出程序", "停止 Hosts 保护")
+
+	// 6. 创建监听器
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal("[!] 创建监听器失败:", err)
+		logEvent("错误", fmt.Sprintf("创建监听器失败: %v", err))
+		return
 	}
 	defer watcher.Close()
 
-	// 4. 添加监听路径
-	// 我们监听 hosts 所在的目录，因为有些编辑器修改文件时会重命名或替换文件
+	// 7. 添加监听路径
 	dir := filepath.Dir(HostsPath)
 	if err := watcher.Add(dir); err != nil {
-		log.Fatal("[!] 添加监听目录失败:", err)
+		logEvent("错误", fmt.Sprintf("添加监听目录失败: %v", err))
+		return
 	}
 
-	// 5. 处理退出信号 (Ctrl+C)
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan
-		fmt.Println("\n正在退出...")
-		os.Exit(0)
-	}()
+	logEvent("监听启动", fmt.Sprintf("开始监控 hosts 文件: %s", HostsPath))
 
-	// 6. 事件循环
+	// 8. 后台监听文件变化
 	go func() {
 		// 防止高频抖动，简单的防抖计时器
 		var debounceTimer *time.Timer
@@ -105,14 +122,11 @@ func main() {
 					continue
 				}
 
-				// 过滤事件类型 (Write, Create, Remove, Rename 等)
-				// 只要不是删除监听本身，通常都视为修改
+				// 过滤事件类型
 				if event.Op&fsnotify.Write == fsnotify.Write || 
 				   event.Op&fsnotify.Create == fsnotify.Create ||
 				   event.Op&fsnotify.Remove == fsnotify.Remove ||
 				   event.Op&fsnotify.Rename == fsnotify.Rename {
-					
-					fmt.Printf("[*] 检测到变化! 事件类型: %v, 文件: %s\n", event.Op, event.Name)
 					
 					// 获取进程信息
 					processInfo := getOpenFileProcess()
@@ -122,31 +136,26 @@ func main() {
 						event.Op, getCurrentUser(), getAdminStatus(), processInfo)
 					logEvent("Hosts 文件修改", eventDesc)
 					
-					// 简单的防抖处理，防止编辑器保存时触发多次
+					// 简单的防抖处理
 					if debounceTimer != nil {
 						debounceTimer.Stop()
 					}
 					
 					debounceTimer = time.AfterFunc(500*time.Millisecond, func() {
-						fmt.Println("[>>>] 发现 hosts 文件被修改，正在执行回退...")
 						logEvent("开始恢复", "正在从备份恢复 hosts 文件...")
 						
 						if err := restoreBackup(); err != nil {
-							fmt.Printf("[!] 回退失败: %v\n", err)
-							logEvent("[!] 恢复失败", fmt.Sprintf("错误信息: %v", err))
+							logEvent("恢复失败", fmt.Sprintf("错误信息: %v", err))
 						} else {
-							fmt.Println("[+] 回退成功! hosts 文件已恢复。")
-							logEvent("[+] 恢复成功", fmt.Sprintf("Hosts 文件已恢复, 用户: %s, 权限: %s", 
+							logEvent("恢复成功", fmt.Sprintf("Hosts 文件已恢复, 用户: %s, 权限: %s", 
 								getCurrentUser(), getAdminStatus()))
 							
 							// 恢复成功后，启动冷却期
-							// 在这个时间内忽略新的事件，避免对恢复操作本身再次响应
 							if cooldownTimer != nil {
 								cooldownTimer.Stop()
 							}
 							cooldownTimer = time.AfterFunc(1000*time.Millisecond, func() {
 								cooldownTimer = nil
-								fmt.Println("[+] 监听已恢复，继续监控...")
 							})
 						}
 					})
@@ -156,19 +165,69 @@ func main() {
 				if !ok {
 					return
 				}
-				fmt.Println("[!] 监听错误:", err)
+				logEvent("监听错误", fmt.Sprintf("错误: %v", err))
 			}
 		}
 	}()
 
-	// 阻塞主线程
-	select {}
+	// 9. 处理菜单点击事件
+	for {
+		select {
+		case <-mShowLog.ClickedCh:
+			openLogFile()
+		case <-mExit.ClickedCh:
+			shouldExit = true
+			systray.Quit()
+			return
+		}
+	}
+}
+
+// onExit 程序退出
+func onExit() {
+	logEvent("程序退出", "Hosts 监控程序已退出")
+	os.Exit(0)
+}
+
+// showErrorMessageBox 显示 Windows 错误对话框
+func showErrorMessageBox(title, message string) {
+	// 仅在 Windows 上执行
+	if runtime.GOOS != "windows" {
+		return
+	}
+	
+	// 使用 Windows API 显示消息框
+	user32 := syscall.NewLazyDLL("user32.dll")
+	messageBox := user32.NewProc("MessageBoxW")
+	
+	// 将字符串转换为 UTF-16（Windows API 使用的格式）
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	messagePtr, _ := syscall.UTF16PtrFromString(message)
+	
+	// MB_ICONERROR = 0x10, MB_OK = 0x00
+	messageBox.Call(0, uintptr(unsafe.Pointer(messagePtr)), uintptr(unsafe.Pointer(titlePtr)), 0x10|0x00)
+}
+
+// hideConsoleWindow 隐藏 Windows 控制台窗口
+func hideConsoleWindow() {
+	// 仅在 Windows 上执行
+	if runtime.GOOS != "windows" {
+		return
+	}
+	
+	getConsoleWindow := syscall.NewLazyDLL("kernel32.dll").NewProc("GetConsoleWindow")
+	showWindow := syscall.NewLazyDLL("user32.dll").NewProc("ShowWindow")
+	
+	hwnd, _, _ := getConsoleWindow.Call()
+	
+	// SW_HIDE = 0
+	showWindow.Call(hwnd, 0)
 }
 
 // initBackup 确保备份文件存在，如果不存在则创建
 func initBackup() error {
 	if _, err := os.Stat(BackupPath); os.IsNotExist(err) {
-		fmt.Println("备份文件不存在，正在创建初始备份...")
+		logEvent("备份", "备份文件不存在，正在创建初始备份...")
 		return copyFile(HostsPath, BackupPath)
 	}
 	return nil
@@ -264,33 +323,16 @@ func logEvent(eventType string, description string) {
 	// 追加写入日志文件
 	file, err := os.OpenFile(LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Printf("日志文件写入失败: %v\n", err)
+		// 静默失败，不输出到控制台（因为窗口已隐藏）
 		return
 	}
 	defer file.Close()
 	
 	// 写入日志
 	if _, err := file.WriteString(logMessage); err != nil {
-		fmt.Printf("日志文件写入失败: %v\n", err)
+		// 静默失败
 		return
 	}
-	
-	// 同时输出到控制台
-	fmt.Print(logMessage)
-}
-
-// getModifyingProcesses 获取修改hosts文件的进程信息
-func getModifyingProcesses() string {
-	// 使用 Get-Process 和 wmi 查询打开 hosts 文件的进程
-	// 使用 lsof 或类似工具在 Windows 上需要额外权限
-	
-	// 尝试从 lsof (如果可用) 获取打开文件的进程
-	processInfo := getOpenFileProcess()
-	if processInfo != "" {
-		return processInfo
-	}
-	
-	return "进程信息:未知"
 }
 
 // getOpenFileProcess 通过系统接口获取打开hosts文件的进程
@@ -353,4 +395,23 @@ func logEventWithProcess(eventType string, description string) {
 	processInfo := getOpenFileProcess()
 	fullDesc := fmt.Sprintf("%s | %s", description, processInfo)
 	logEvent(eventType, fullDesc)
+}
+
+// openLogFile 打开日志文件
+func openLogFile() {
+	cmd := exec.Command("notepad.exe", LogPath)
+	cmd.Start()
+}
+
+// loadTrayIcon 加载嵌入的托盘图标
+func loadTrayIcon() {
+	// 使用编译时嵌入的图标数据
+	if len(embeddedIcon) == 0 {
+		logEvent("图标加载", "嵌入的图标数据为空，使用默认图标")
+		return
+	}
+	
+	// 设置托盘图标
+	systray.SetIcon(embeddedIcon)
+	logEvent("图标加载", fmt.Sprintf("自定义图标已加载 (编译嵌入, 大小: %d 字节)", len(embeddedIcon)))
 }
