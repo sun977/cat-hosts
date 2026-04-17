@@ -1,0 +1,44 @@
+# System files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+modules.xml
+vcs.xml
+
+# Trae IDE
+.trae
+
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+bfg.jar
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+ 
+# Go workspace file
+go.work
+
+# Release builds
+release/
+
+
+# # Config files with sensitive info
+# .env
+# configs/config.yaml
+
+# Logs
+*.log
